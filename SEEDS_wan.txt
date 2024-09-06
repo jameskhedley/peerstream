@@ -1,0 +1,3 @@
+#this is a list of machines we know should be up and running peerstream most of the time. You can add more if you like.
+167.99.223.134
+128.199.51.61

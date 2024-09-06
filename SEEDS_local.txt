@@ -1,0 +1,3 @@
+#this is a list of machines we know should be up and running peerstream most of the time. You can add more if you like.
+localhost:5001
+localhost:5002

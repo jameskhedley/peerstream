@@ -1,0 +1,389 @@
+#! /usr/bin/env python
+
+import sys
+from inspect import currentframe, getframeinfo
+import random
+import glob
+import string
+import re
+import time
+import os, shutil
+import logging
+import json
+import threading
+from multiprocessing import Process, Manager
+from collections import deque
+from flask import Flask, Response, request, send_from_directory
+import cherrypy
+#from crossdomain import crossdomain
+#from flask_cors import CORS
+#from pymediainfo import MediaInfo
+import requests
+from requests.exceptions import ConnectionError, ReadTimeout, ConnectTimeout
+
+class DummyLock(object):
+    def __init__(self):
+        pass
+    def acquire(self):
+        pass
+    def release(self):
+        pass
+
+PLAYLIST_HEAD ='''#EXTM3U
+#EXT-X-PLAYLIST-TYPE:EVENT
+#EXT-X-VERSION:3
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-ALLOW-CACHE:YES
+#EXT-X-TARGETDURATION:5
+'''
+
+current_stream = 0
+
+def playlist(request):
+    #print "*******playlist()"  
+    playlist_tail = ""
+    for i in sorted(list(SLOTS.items())[:-1]):
+        playlist_tail += '''#EXTINF:5,
+%sstream%d.ts
+''' % (request.url_root, i[0])
+    PLAYLIST = PLAYLIST_HEAD + playlist_tail
+    #print "********PLAYLIST is: %s" % PLAYLIST
+    return Response(response=PLAYLIST, status='200 OK', headers=[('Content-type', 'application/x-mpegURL')])
+
+PROTO = "http://" #TODO oof
+CHUNK = 10000
+#TODO shouldn't have globals here? 
+global PEERS
+global SLOTS
+PEERS = set()
+PORT = None
+#TODO handle connectivity issues, timeouts
+MY_IP = requests.get('http://whatismyip.akamai.com/').content
+SERVER_PROCESS = None
+INPUT_PROCESS = None
+
+logging.basicConfig(filename='server.log',level=logging.DEBUG)
+logging.info('Server init!')
+
+def gen_stream():
+    global current_stream
+    if SLOTS:
+         data = SLOTS[current_stream]
+         while data:
+             batch = data[0:CHUNK] #10K
+             data = data[CHUNK:]
+             yield batch
+         #TODO guess this saves memory but don't know if good idea
+         #SLOTS[current_stream]=None
+         return
+    return
+
+app = Flask(__name__, static_url_path='/hls', static_folder='hls')
+#CORS(app)
+
+STREAM_RE = re.compile(".*stream(\S+)\.ts.*")
+
+@app.route('/<path:path>')
+@app.route('/', defaults={'path': ''})
+#@crossdomain(origin='*', headers="Content-Type, Content-Length, Range")
+def index(path):
+    #TODO only allow this from localhost??
+    global current_stream
+    match = STREAM_RE.match(path)
+    if "stream.m3u8" in path:
+        return playlist(request)
+    elif match:
+        current_stream = int(match.groups()[0])
+        if not current_stream in list(SLOTS.keys()):
+            print("client requested strem %d but can't find it" % (current_stream))
+            print(str(list(SLOTS.keys())))
+            return Response(status='202 Accepted', headers=[('Content-type', 'text/plain')])
+        logging.info("Client requested stream %d" % current_stream)
+        return Response(gen_stream(), mimetype='video/MP2T')
+    else:
+        return Response(status='404 Not Found', headers=[('Content-type', 'text/plain')])
+
+@app.route('/register', methods=['POST'])
+def register_peer():
+    global PEERS
+    logging.debug("request.form = %s" % str(request.form))
+    peer_address = request.form['address']
+    PEERS.add(peer_address)
+    return Response(status='200 OK', response="OK", headers=[('Content-type', 'text/plain')])
+    
+
+@app.route('/clip', methods=['GET'])
+def request_clip():
+    logging.info("*** remote address = " + request.remote_addr)
+    if mode == 'seed':
+        #random here is meant to be 0.1 chance to actually serve clip
+        if random.randint(0,9) > 0 and len(PEERS) > 2:
+            proxy_url = random.choice(list(PEERS))
+            return Response(status="305 Use Proxy", response=proxy_url)
+    # if we got a clip from the requesting, assume it's a good host
+    # TODO actually no don't because we can only see IP not port. 
+    # Peer needs to tell us where it is using /notify.
+    #PEERS.add(request.remote_addr)
+    logging.debug("request_clip: PEERS is now %s" % (str(PEERS)))
+    try:
+        clip_int = int(request.args.get('key', ''))
+    except ValueError:
+        return Response(status='400 Error', response="clips must be an integer", 
+                        headers=[('Content-type', 'text/plain')])
+
+    requested_file = 'OUTPUT%03d.ts' % clip_int
+
+    if os.path.exists(requested_file):
+        with open(requested_file, 'rb') as hclip:
+            clip_data = hclip.read()
+        return Response(status='200 OK', response=clip_data, headers=[('Content-type', 'video/MP2T')])
+    else:
+        #print "404 on clip %d with file name %s" % (clip_int, requested_file)
+        return Response(status='404 Not found', response="haven't got this clip", 
+                        headers=[('Content-type', 'text/plain')])
+
+@app.route('/shutdown', methods=['GET'])
+def shutdown():
+    shutdown_server()
+    return "OK"
+
+@app.route('/hello', methods=['GET'])
+def hello():
+    return Response(status='200 OK', response="wagwan", headers=[('Content-type', 'text/plain')])
+
+@app.route('/peers', methods=['GET'])
+def peers():
+    data = json.dumps(list(PEERS))
+    return Response(status='200 OK', response=data, headers=[('Content-type', 'application/json')])
+
+def input_loop_peers(SLOTS):
+    global PEERS
+    clip_counter = 0
+    while True:
+        #logging.debug("SLOTS.keys() = %s" % SLOTS.keys())
+        #check_kill_flag()
+        if clip_counter in list(SLOTS.keys()):
+            clip_counter += 1
+            time.sleep(1)
+            continue
+        else:
+            if not PEERS:
+                logging.warning("No peers left!") #TODO this is pretty bad, what do?
+                time.sleep(10)
+            #ask peers if they have this segment
+            for peer in random.sample(PEERS, len(PEERS)):
+                #TODO bit naff
+                if ":"+ str(arg_port) in peer:
+                    logging.debug("don't register with yourself")
+                    time.sleep(1)
+                    continue
+                logging.info("registering with peer %s" % (peer))
+                register_url = '%sregister' % (peer)
+                try:
+                    logging.debug(register_url)
+                    resp = requests.post(register_url, 
+                                         data={'address': 'http://%s:%s/' % (MY_IP, str(arg_port))},
+                                         timeout=2.0)
+                except ConnectionError:
+                    logging.warning("register - peer %s is down" % peer)
+                else:
+                    if resp.status_code == 200:
+                        logging.warning("register - 200 OK")
+                    else:
+                        logging.warning("register - status code was %d" % resp.status_code)
+                    #TODO interpret resp
+                
+                logging.info("asking peer %s for clip %d" % (peer, clip_counter))
+                clip_url = '%sclip?key=%d' % (peer, clip_counter)
+                logging.debug("url is %s" % (clip_url))
+                try:
+                    resp = requests.get(clip_url, timeout=2.0)
+                except ConnectionError:
+                    logging.warning("clip - peer %s is down" % peer)
+                    time.sleep(1)
+                    continue
+                if resp.status_code == 200:
+                    received_file = 'OUTPUT%03d.ts' % clip_counter
+                    with open(received_file, 'wb') as hclip:
+                        hclip.write(resp.content)
+                    SLOTS[clip_counter] = resp.content
+                    logging.debug("wrote clip %d" % clip_counter)
+                    #logging.debug("asking peer %s for more peers" % (peer))
+                    #peers_url = '%speers' % (peer)
+                    #try:
+                    #    resp = requests.get(peers_url, timeout=2.0)
+                    #except ConnectionError:
+                    #    logging.warning("peer %s is down" % peer) #TODO remove from PEERS?
+                    #else:
+                    #    if resp.status_code == 200:
+                    #        logging.warning("Got peers list: %s" % (str(resp.content)))
+                    #        PEERS = PEERS.union(set(json.loads(resp.content)))
+                    #        logging.warning("Peers list is now: %s" % (str(PEERS)))
+                         
+                elif resp.status_code == 404: #not found
+                    logging.warn("get clip failed with 404, check URL")
+                    time.sleep(1)
+                #once the seed gets a few peers registered it'll issue redirects to them
+                #to prevent getting jammed up with xfers
+                elif resp.status_code == 305: #use proxy
+                    logging.info("Seed gave 305 redirect" + resp.content)
+                    #TODO should try the redirect url now or just throw on pile?
+                    PEERS.add(resp.content) #throw on pile
+                    time.sleep(1)
+
+def input_loop_ffmpeg(SLOTS): 
+    RE0 = re.compile('OUTPUT(\d+).ts')
+    current_segment = 0
+    pt = 0
+    while True:
+        #check_kill_flag() #TODO can kill process directly?
+        files = glob.glob("OUTPUT*.ts")
+        files.sort(key = lambda x: ''.join([c for c in x if c in string.digits]).zfill(4))
+        if pt >= len(files):
+            time.sleep(1)
+            logging.info("No clips found")
+            continue
+        pt+=1
+        if (pt - current_segment) < 1:
+            continue
+        clip_name = files[current_segment]
+        current_segment += 1
+        logging.info("Loading clip %s" % (clip_name))
+        with open(clip_name, 'rb') as hclip:
+            data = hclip.read()
+        if data:
+            print('THREAD: putting clip %s on queue, %d bytes' % (clip_name, len(data)))
+            stream_num = int(RE0.search(clip_name).groups()[0])
+            SLOTS[stream_num] = data
+            
+        time.sleep(0.5)
+
+def peer_thread():
+    global PEERS
+    time.sleep(3)
+    while True:
+        for peer in PEERS: #TODO PEERS should never be empty, if it is then seeds are dead
+            logging.info("asking peer %s for more peers" % (peer))
+            peers_url = '%s%s\peers' % (PROTO, peer)
+            try:
+                resp = requests.get(peers_url, timeout=3.1)
+            except ConnectionError:
+                logging.warning("peer %s is unreachable" % peer)
+                PEERS.remove(peer)
+            except (ReadTimeout, ConnectTimeout):
+                logging.warning("peer %s timed out" % peer)
+            else:
+                if resp.status_code == 200:
+                    logging.info("Got peers list: %s" % (str(resp.content)))
+                    PEERS = PEERS.union(set(json.loads(resp.content)))
+                    logging.info("Peers list is now: %s" % (str(PEERS)))
+                else:
+                    logging.warning("Unexpected status %d from peer %s" % (resp.status_code, peer))
+            time.sleep(1)
+            print("HELLO")
+        
+def run_server_wz(port, host='0.0.0.0', processes=1, debug=False):
+    '''run using flasks built-in werkzeug server'''
+    app.run(host, port, debug, processes)
+    
+def run_server_cherry(port, host='0.0.0.0', processes=1, debug=False):    
+    '''run using cherrypy'''
+    cherrypy.tree.graft(app.wsgi_app, '/')
+    print("GRAFT SUCCESSFUL")
+    cherrypy.config.update({'server.socket_host': host,
+                            'server.socket_port': port,
+                            'engine.autoreload.on': False,})
+    cherrypy.engine.start()
+
+run_server = run_server_cherry
+#run_server = run_server_wz
+
+def run_server_proc(port, host='0.0.0.0', processes=1, debug=False):
+    '''initialise both the api server and input loop'''
+    global SERVER_PROCESS
+    global INPUT_PROCESS
+    global SLOTS
+    global PEERS
+    #load initial peers from SEEDS.txt
+    with open('SEEDS.txt') as h_seeds: #TODO do some verification here.
+        PEERS = [x.strip() for x in h_seeds.readlines() if not x.startswith('#')]
+    manager = Manager()
+    SLOTS = manager.dict()
+   
+    logging.info('Request to run server')
+    if SERVER_PROCESS:
+        logging.error('Server already running')
+        return None
+    SERVER_PROCESS = Process(target=run_server, args=[port, host, processes, debug])
+    logging.info('Starting web server...')
+    SERVER_PROCESS.start()
+    logging.info('Web server started')
+    #TODO should have an arg saying whether we're in peer mode or source mode, for now assume source
+    INPUT_PROCESS = Process(target=input_loop_ffmpeg, args=[SLOTS,])
+    logging.info('Starting input loop...')
+    INPUT_PROCESS.start()
+    logging.info('Input loop started')
+    logging.info('Starting peer discovery thread...')
+    pt = threading.Thread(target=peer_thread, daemon=True)
+    pt.start()
+    logging.info('Peer discovery thread started.')
+    logging.info('Init complete!')
+
+def is_server_running():
+    global SERVER_PROCESS
+    global INPUT_PROCESS
+    if not (bool(SERVER_PROCESS) | bool(INPUT_PROCESS)):
+        return False
+    return SERVER_PROCESS.is_alive() & INPUT_PROCESS.is_alive()
+
+def stop_server_proc():
+    global SERVER_PROCESS
+    global INPUT_PROCESS
+    cherrypy.engine.exit()
+    for p in (SERVER_PROCESS, INPUT_PROCESS):
+        if p.is_alive():
+            p.terminate()
+
+#DEBUG only
+def dbg_print_line_number(frameinfo):
+    #HINT call like: dbg_print_line_number(getframeinfo(currentframe()))
+    print(frameinfo.filename, frameinfo.lineno)
+
+    
+if __name__ in ('__main__'):
+    global arg_port
+    global mode
+    global SLOTS
+    #NB these can't be in module scope 
+    manager = Manager()
+    SLOTS = manager.dict()
+    if __name__ == '__main__':
+        try:
+            arg_port = int(sys.argv[1])
+            mode = sys.argv[2]
+        except IndexError:
+            print("need a port number and mode")
+            sys.exit()
+    
+    if mode == 'source':
+        INPUT_PROCESS  = Process(target=input_loop_ffmpeg, args=[SLOTS,])
+    elif mode == 'seed': #TODO should seed protect address of source peer? Answer: Nah.
+        #TODO is it any different to a peer though? How?
+        source_url = sys.argv[3]
+        PEERS.add(source_url)
+        print("INIT: source is %s" % source_url)
+        INPUT_PROCESS = Process(target=input_loop_peers, args=[SLOTS,])
+    elif mode == 'peer':   
+        seed = sys.argv[3]
+        PEERS.add(seed)
+        print("INIT: seed is %s" % seed)
+        INPUT_PROCESS = Process(target=input_loop_peers, args=[SLOTS,])
+    else:
+        print("invalid mode, use seed | peer")
+        sys.exit(1)
+    INPUT_PROCESS.start()
+    run_server(arg_port)
+    #All modes need peer discovery
+    pt = threading.Thread(target=peer_thread, daemon=True)
+    pt.start()
+    INPUT_PROCESS.join()

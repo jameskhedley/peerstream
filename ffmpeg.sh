@@ -1,0 +1,1 @@
+ffmpeg -video_size 1024x768 -framerate 25 -f x11grab -i :0.0+100,200 -c:v libx264 -flags -global_header -hls_time 10 -hls_list_size 100 -hls_wrap 100 -hls_segment_filename 'OUTPUT%03d.ts' -start_number 0 ffmpeg_stream.m3u8

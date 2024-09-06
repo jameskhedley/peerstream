@@ -1,0 +1,17 @@
+Multiple channels
+Upload rate limit
+Cache size limit, cleanup thread
+Channel list
+Record option?
+Seed list edit (max number, maybe 5)
+Found peer list in GUI with auto refresh, 1 sec?
+Some sort of progress bar?
+Screen capture mode, invoking ffmpeg
+Open channel by link
+Port test?
+Only allow clips/playlist from local address
+Test suite, including multi-instance environment
+
+Add 2 usage modes to GUI - broadcast and watch
+Server status display.
+
